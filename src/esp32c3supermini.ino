@@ -33,26 +33,52 @@ WiFiUDP udp;                       // Create a WiFiUDP object
 const unsigned int udpPort = 19999; // UDP communication port
 const unsigned int tcpPort = 18888; // TCP communication port
 WiFiClient tcpClient;
-WiFiServer tcpServer;
+WiFiServer tcpServer(tcpPort);
 
 IPAddress targetIp; // Store the IP address of the Station device
+
+void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
+{
+  switch (event)
+  {
+  case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
+    Serial.print("[Event] Device connected to AP, MAC: ");
+    for (int i = 0; i < 6; i++)
+    {
+      Serial.printf("%02X", info.wifi_ap_staconnected.mac[i]);
+      if (i < 5) Serial.print(":");
+    }
+    Serial.println();
+    Serial.println("Note: IP address is not assigned yet. It will be shown when TCP client connects.");
+    break;
+  case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:
+    Serial.println("[Event] Device disconnected from AP");
+    break;
+  default:
+    break;
+  }
+}
 
 void setup()
 {
   setCpuFrequencyMhz(80); 
   Serial.begin(115200);
+  WiFi.onEvent(WiFiEvent);
+  WiFi.setSleep(false); // Disable WiFi sleep for better stability
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP); // BOOT button input pull-up
   pinMode(LED_PIN, OUTPUT);               // LED pin output
 
   bootTime = millis();
 
   Serial1.begin(UART_BAUD_RATE, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+  Serial1.setRxBufferSize(2048); // Increase RX buffer size
 
   if (apMode)
   {
     startAPMode();
-    Serial.println("TCP server started, waiting for client connection...");
-    tcpServer.begin(tcpPort);
+    tcpServer.setNoDelay(true); // Disable Nagle's algorithm
+    tcpServer.begin();
+    Serial.println("TCP server started on port 18888, waiting for client connection...");
   }
   else
   {
@@ -72,21 +98,41 @@ void loop()
     connectToAP();
   }
 
-  // If in AP mode and a device is connected, record the first connected device's IP address
-  if (apMode && !targetIp)
-  {
-    getStationIp();
+  // Handle TCP Server connections in AP mode
+  static bool clientConnected = false;
+  
+  if (apMode) {
+    // Check if current client is disconnected
+    if (clientConnected && (!tcpClient || !tcpClient.connected())) {
+        Serial.println("TCP Client disconnected");
+        clientConnected = false;
+        tcpClient.stop();
+    }
+
+    // Accept new clients if not connected
+    if (!clientConnected) {
+        WiFiClient newClient = tcpServer.accept();
+        if (newClient) {
+            tcpClient = newClient;
+            clientConnected = true;
+            tcpClient.setNoDelay(true); // Low latency for Proxmark3
+            Serial.println("New TCP Client connected");
+            Serial.print("Client IP: ");
+            Serial.println(tcpClient.remoteIP());
+        }
+    }
   }
 
-  if (apMode) {
-    if (!tcpClient || !tcpClient.connected()) {
-      tcpClient = tcpServer.accept();
-    }
+  // Heartbeat log every 10 seconds if waiting
+  static unsigned long lastHeartbeat = 0;
+  if (apMode && !clientConnected && millis() - lastHeartbeat > 10000) {
+     Serial.println("Waiting for TCP connection at IP: 192.168.4.1 Port: 18888");
+     lastHeartbeat = millis();
   }
 
   updateLedStatus();
 
-  if(apMode){
+  if(apMode && tcpClient && tcpClient.connected()){
     handleTcpToUart();
     handelUartToTcp();
   }
@@ -184,8 +230,8 @@ void toggleMode()
     WiFi.disconnect();
     apMode = true;
     startAPMode();
-    udp.begin(udpPort);
-    Serial.println("UDP server started, waiting for client message...");
+    tcpServer.begin(tcpPort);
+    Serial.println("TCP server started, waiting for client connection...");
   }
   lastLedToggle = millis();
 }
@@ -315,8 +361,8 @@ void handelUartToTcp()
     buffer[length++] = Serial1.read();
   }
 
-  // If there is data and target IP exists, send immediately
-  if (length > 0 && targetIp)
+  // If there is data and Client is connected, send immediately
+  if (length > 0 && tcpClient && tcpClient.connected())
   {
     tcpClient.write((uint8_t *)buffer, length);
     tcpClient.flush();
@@ -352,6 +398,14 @@ void handleTcpToUart()
 
     // Batch write to UART
     Serial1.write(buffer, length);
+
+    unsigned long timestamp = millis(); // Get current timestamp
+    Serial.printf("[%lu ms] [TCP->UART] ", timestamp);
+    for (int i = 0; i < length; i++)
+    {
+      Serial.printf("%02X", buffer[i]);
+    }
+    Serial.println();
   }
 }
 
